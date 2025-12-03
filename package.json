@@ -35,6 +35,10 @@
   "contributes": {
     "commands": [
       {
+        "command": "clPrompter.testPrompt",
+        "title": "CL Prompter: Test Prompt (returns string)"
+      },
+      {
         "command": "clPrompter.clPrompter",
         "title": "CL Prompter"
       }

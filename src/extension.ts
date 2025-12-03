@@ -25,7 +25,30 @@ import { getCMDXML } from './getcmdxml';
 
 let baseExtension: Extension<CodeForIBMi> | undefined;
 
-export async function activate(context: vscode.ExtensionContext) {
+export interface PromptOptions {
+    column?: vscode.ViewColumn;
+    timeoutMs?: number;
+    allowMultiple?: boolean;
+    insertIntoEditor?: boolean; // default false
+}
+
+export interface PromptArgs {
+    cmdName?: string;
+    label?: string;
+    xml?: string;
+    initialCommand?: string;
+    options?: PromptOptions;
+}
+
+export interface CLPrompterAPI {
+    prompt: (args?: PromptArgs) => Promise<string | undefined>;
+    showPrompt: (extensionUri?: vscode.Uri) => Promise<void>;
+    createOrShow: (extensionUri: vscode.Uri) => Promise<void>;
+    version: string;
+    isAvailable: () => boolean;
+}
+
+export async function activate(context: vscode.ExtensionContext): Promise<CLPrompterAPI> {
 
     baseExtension = extensions.getExtension<CodeForIBMi>("halcyontechltd.code-for-ibmi");
     if (baseExtension) {
@@ -48,7 +71,49 @@ export async function activate(context: vscode.ExtensionContext) {
             await ClPromptPanel.createOrShow(context.extensionUri);
         })
     );
+    // Test command: invoke public API and show the returned command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('clPrompter.testPrompt', async () => {
+            const api: CLPrompterAPI = {
+                prompt: async (args?: PromptArgs) => await ClPromptPanel.prompt(context.extensionUri, args),
+                showPrompt: async (extensionUri?: vscode.Uri) => {
+                    await ClPromptPanel.createOrShow(extensionUri ?? context.extensionUri);
+                },
+                createOrShow: async (extensionUri: vscode.Uri) => {
+                    await ClPromptPanel.createOrShow(extensionUri);
+                },
+                version: '1.0.0',
+                isAvailable: () => true
+            };
+
+            const result = await api.prompt({
+                options: { timeoutMs: 120000 }
+            });
+            if (result) {
+                vscode.window.showInformationMessage(`Generated CL: ${result}`);
+            } else {
+                vscode.window.showInformationMessage('Prompt canceled or timed out.');
+            }
+        })
+    );
     console.log('CL Prompter activate [end]');
+
+    const api: CLPrompterAPI = {
+        prompt: async (args?: PromptArgs): Promise<string | undefined> => {
+            const extUri = context.extensionUri;
+            return await ClPromptPanel.prompt(extUri, args);
+        },
+        showPrompt: async (extensionUri?: vscode.Uri) => {
+            await ClPromptPanel.createOrShow(extensionUri ?? context.extensionUri);
+        },
+        createOrShow: async (extensionUri: vscode.Uri) => {
+            await ClPromptPanel.createOrShow(extensionUri);
+        },
+        version: '1.0.0',
+        isAvailable: () => true
+    };
+
+    return api;
 }
 
 
@@ -60,6 +125,8 @@ export class ClPromptPanel {
     private _editor: vscode.TextEditor | undefined;
     private _selection: vscode.Selection | undefined;
     private _documentUri: vscode.Uri | undefined;
+    private _pendingResolve: ((value: string | undefined) => void) | undefined;
+    private _pendingTimeout: NodeJS.Timeout | undefined;
 
     // ✅ Added method to reset webview state
     public resetWebviewState() {
@@ -133,6 +200,93 @@ export class ClPromptPanel {
             ClPromptPanel.currentPanel = new ClPromptPanel(
                 panel, extensionUri, cmdName, cmdLabel, xml, editor, selection, fullCmd);
         }
+    }
+
+    // Public API: prompt and resolve on Save/Cancel
+    public static async prompt(extensionUri: vscode.Uri, args?: PromptArgs): Promise<string | undefined> {
+        const column = args?.options?.column ?? vscode.window.activeTextEditor?.viewColumn ?? vscode.ViewColumn.One;
+        const allowMultiple = args?.options?.allowMultiple ?? false;
+
+        if (ClPromptPanel.currentPanel && !allowMultiple) {
+            // Reuse existing panel; update XML/context and set resolver
+            const panel = ClPromptPanel.currentPanel;
+            // Compute inputs similar to createOrShow
+            let fullCmd = args?.initialCommand ?? '';
+            let editor = vscode.window.activeTextEditor;
+            let selection: vscode.Selection | undefined;
+            if (!fullCmd && editor) {
+                const cmdResult = collectCLCmd(editor);
+                fullCmd = cmdResult.command;
+                selection = new vscode.Selection(cmdResult.startLine, 0, cmdResult.endLine, editor.document.lineAt(cmdResult.endLine).text.length);
+            }
+            let cmdName = args?.cmdName ?? extractCmdName(fullCmd);
+            if (!cmdName || cmdName.trim() === '') {
+                cmdName = (await askUserForCMDToPrompt(fullCmd)).toString();
+            }
+            const xml = args?.xml ?? await getCMDXML(cmdName);
+            await panel.setXML(cmdName, xml, editor, selection);
+            panel._panel.reveal(column);
+            return new Promise<string | undefined>((resolve) => {
+                panel._pendingResolve = resolve;
+                const timeoutMs = args?.options?.timeoutMs;
+                if (timeoutMs && timeoutMs > 0) {
+                    panel._pendingTimeout && clearTimeout(panel._pendingTimeout);
+                    panel._pendingTimeout = setTimeout(() => {
+                        if (panel._pendingResolve) {
+                            panel._pendingResolve(undefined);
+                            panel._pendingResolve = undefined;
+                        }
+                        panel._panel.dispose();
+                    }, timeoutMs);
+                }
+            });
+        }
+
+        const editor = vscode.window.activeTextEditor;
+        let fullCmd = args?.initialCommand ?? '';
+        let selection: vscode.Selection | undefined;
+        if (!fullCmd && editor) {
+            const cmdResult = collectCLCmd(editor);
+            fullCmd = cmdResult.command;
+            selection = new vscode.Selection(cmdResult.startLine, 0, cmdResult.endLine, editor.document.lineAt(cmdResult.endLine).text.length);
+        }
+
+        let cmdName = args?.cmdName ?? extractCmdName(fullCmd);
+        if (!cmdName || cmdName.trim() === '') {
+            cmdName = (await askUserForCMDToPrompt(fullCmd)).toString();
+        }
+        if (!cmdName || cmdName.trim() === '') {
+            return undefined;
+        }
+        const cmdLabel = args?.label ?? extractCmdLabel(fullCmd);
+        const xml = args?.xml ?? await getCMDXML(cmdName);
+
+        const panel = vscode.window.createWebviewPanel(
+            'clPrompter',
+            'CL Prompt',
+            column,
+            {
+                enableScripts: true,
+                localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')]
+            }
+        );
+        ClPromptPanel.currentPanel = new ClPromptPanel(panel, extensionUri, cmdName, cmdLabel, xml, editor, selection, fullCmd);
+
+        return new Promise<string | undefined>((resolve) => {
+            ClPromptPanel.currentPanel!._pendingResolve = resolve;
+            const timeoutMs = args?.options?.timeoutMs;
+            if (timeoutMs && timeoutMs > 0) {
+                ClPromptPanel.currentPanel!._pendingTimeout && clearTimeout(ClPromptPanel.currentPanel!._pendingTimeout);
+                ClPromptPanel.currentPanel!._pendingTimeout = setTimeout(() => {
+                    const inst = ClPromptPanel.currentPanel;
+                    if (inst && inst._pendingResolve) {
+                        inst._pendingResolve(undefined);
+                        inst._pendingResolve = undefined;
+                    }
+                    panel.dispose();
+                }, timeoutMs);
+            }
+        });
     }
 
     private _cmdName: string;
@@ -289,6 +443,13 @@ export class ClPromptPanel {
                         const formatted = formatCLCmd(label, cmdName, paramStr);
 
                         // Use the active document's EOL
+                        // Resolve external API if waiting
+                        if (this._pendingResolve) {
+                            this._pendingResolve(formatted);
+                            this._pendingResolve = undefined;
+                        }
+
+                        // Default behavior: insert back into editor only if selection is available
                         if (this._documentUri && this._selection) {
                             vscode.workspace.openTextDocument(this._documentUri).then(doc => {
                                 vscode.window.showTextDocument(doc, { preview: false }).then(editor => {
@@ -305,16 +466,16 @@ export class ClPromptPanel {
                                 });
                             });
                         } else {
-                            vscode.window.showWarningMessage(
-                                'Could not insert command: original editor is no longer open.'
-                            );
-                            vscode.env.clipboard.writeText(formatted);
-                            vscode.window.showInformationMessage('CL command copied to clipboard.');
+                            // No editor available; just dispose after resolving
                             this._panel.dispose();
                         }
                         break;
                     }
                     case 'cancel': {
+                        if (this._pendingResolve) {
+                            this._pendingResolve(undefined);
+                            this._pendingResolve = undefined;
+                        }
                         this._panel.dispose();
                         break;
                     }
